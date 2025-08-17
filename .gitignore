@@ -5,6 +5,9 @@ __pycache__/
 
 # C extensions
 *.so
+transformer_env/
+models/
+data/
 
 # Distribution / packaging
 .Python
