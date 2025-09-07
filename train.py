@@ -10,12 +10,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
 from encoder import Encoder
 from decoder import Decoder
 from utils import create_padding_mask, create_combined_mask, TranslationDataset, create_dataloader
 from typing import Optional
 import time
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 class Transformer(nn.Module):
     """Complete Transformer model combining encoder and decoder"""
@@ -315,8 +317,8 @@ class CheckpointManager:
                        scheduler: 'NoamLR', epoch: int, train_losses: list, 
                        val_losses: list, learning_rates: list, gradient_norms: list,
                        parameter_stats: list, config: dict, is_best: bool = False,
-                       best_val_loss: float = float('inf')):
-        """Save model checkpoint"""
+                       best_val_loss: float = float('inf'), scaler=None):
+        """Save model checkpoint with optional scaler support"""
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -331,6 +333,10 @@ class CheckpointManager:
             'config': config
         }
         
+        # Save scaler state if using mixed precision
+        if scaler is not None:
+            checkpoint['scaler_state_dict'] = scaler.state_dict()
+        
         # Save regular checkpoint
         checkpoint_path = os.path.join(self.model_dir, f'checkpoint_epoch_{epoch}.pt')
         torch.save(checkpoint, checkpoint_path)
@@ -342,7 +348,7 @@ class CheckpointManager:
             print(f"New best model saved with validation loss: {best_val_loss:.4f}")
     
     def load_checkpoint(self, checkpoint_path: str, model: nn.Module, 
-                       optimizer: optim.Optimizer, scheduler: 'NoamLR', device: torch.device):
+                       optimizer: optim.Optimizer, scheduler: 'NoamLR', device: torch.device, scaler=None):
         """Load model checkpoint and return epoch number and training state"""
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -350,6 +356,11 @@ class CheckpointManager:
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scheduler.step_count = checkpoint['scheduler_state_dict']
+            
+            # Load scaler state if available and scaler is provided
+            if scaler is not None and 'scaler_state_dict' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                print("✅ Mixed precision scaler state loaded")
             
             print(f"Checkpoint loaded from epoch {checkpoint['epoch']}")
             return (checkpoint['epoch'], 
@@ -489,6 +500,25 @@ class Trainer:
             warmup_steps=config.warmup_steps
         )
         
+        # Mixed precision training
+        self.use_amp = getattr(config, 'use_amp', False) and device.type == 'cuda'
+        self.scaler = GradScaler() if self.use_amp else None
+        
+        # Gradient accumulation
+        self.accumulation_steps = getattr(config, 'accumulation_steps', 1)
+        self.effective_batch_size = config.batch_size * self.accumulation_steps
+        
+        if self.use_amp:
+            print("✅ Mixed precision training enabled")
+        else:
+            print("❌ Mixed precision training disabled")
+            
+        if self.accumulation_steps > 1:
+            print(f"✅ Gradient accumulation enabled: {self.accumulation_steps} steps")
+            print(f"✅ Effective batch size: {self.effective_batch_size}")
+        else:
+            print("❌ Gradient accumulation disabled")
+        
         # Training state
         self.current_epoch = 0
         self.best_val_loss = float('inf')
@@ -498,13 +528,14 @@ class Trainer:
         self.logger = TrainingLogger(config.model_dir)
         self.checkpoint_manager = CheckpointManager(config.model_dir)
     
-    def train_step(self, src: torch.Tensor, tgt: torch.Tensor) -> tuple:
+    def train_step(self, src: torch.Tensor, tgt: torch.Tensor, accumulate: bool = False) -> tuple:
         """
-        Single training step
+        Single training step with mixed precision and gradient accumulation support
         
         Args:
             src: Source sequence tensor
             tgt: Target sequence tensor
+            accumulate: If True, don't zero gradients and don't step optimizer
         
         Returns:
             Tuple of (loss, learning_rate, gradient_norm)
@@ -513,40 +544,84 @@ class Trainer:
         src = src.to(self.device)
         tgt = tgt.to(self.device)
         
-        # Forward pass
-        self.optimizer.zero_grad()
-        logits = self.model(src, tgt)
+        # Zero gradients only if not accumulating
+        if not accumulate:
+            self.optimizer.zero_grad()
         
-        # Prepare target for loss computation
-        # Remove <bos> token and shift target for teacher forcing
-        tgt_input = tgt[:, :-1]  # Remove last token
-        tgt_output = tgt[:, 1:]  # Remove first token (<bos>)
+        if self.use_amp:
+            # Mixed precision forward pass
+            with autocast():
+                logits = self.model(src, tgt)
+                
+                # Prepare target for loss computation
+                tgt_input = tgt[:, :-1]  # Remove last token
+                tgt_output = tgt[:, 1:]  # Remove first token (<bos>)
+                
+                # Reshape logits and targets for loss computation
+                batch_size, seq_len, vocab_size = logits.shape
+                logits_flat = logits[:, :-1, :].contiguous().view(-1, vocab_size)
+                targets_flat = tgt_output.contiguous().view(-1)
+                
+                # Compute loss and normalize by accumulation steps
+                loss = self.criterion(logits_flat, targets_flat) / self.accumulation_steps
+            
+            # Backward pass with scaling
+            self.scaler.scale(loss).backward()
+            
+            grad_norm = 0.0
+            current_lr = 0.0
+            
+            # Only perform optimizer step if not accumulating
+            if not accumulate:
+                # Unscale gradients and clip
+                self.scaler.unscale_(self.optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                
+                # Optimizer step with scaling
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                
+                # Update learning rate
+                current_lr = self.scheduler.step()
+            
+        else:
+            # Regular precision forward pass
+            logits = self.model(src, tgt)
+            
+            # Prepare target for loss computation
+            tgt_input = tgt[:, :-1]  # Remove last token
+            tgt_output = tgt[:, 1:]  # Remove first token (<bos>)
+            
+            # Reshape logits and targets for loss computation
+            batch_size, seq_len, vocab_size = logits.shape
+            logits_flat = logits[:, :-1, :].contiguous().view(-1, vocab_size)
+            targets_flat = tgt_output.contiguous().view(-1)
+            
+            # Compute loss and normalize by accumulation steps
+            loss = self.criterion(logits_flat, targets_flat) / self.accumulation_steps
+            
+            # Backward pass
+            loss.backward()
+            
+            grad_norm = 0.0
+            current_lr = 0.0
+            
+            # Only perform optimizer step if not accumulating
+            if not accumulate:
+                # Compute gradient norm before clipping
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+                
+                # Optimizer step
+                self.optimizer.step()
+                
+                # Update learning rate
+                current_lr = self.scheduler.step()
         
-        # Reshape logits and targets for loss computation
-        batch_size, seq_len, vocab_size = logits.shape
-        logits_flat = logits[:, :-1, :].contiguous().view(-1, vocab_size)
-        targets_flat = tgt_output.contiguous().view(-1)
-        
-        # Compute loss
-        loss = self.criterion(logits_flat, targets_flat)
-        
-        # Backward pass
-        loss.backward()
-        
-        # Compute gradient norm before clipping
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-        
-        # Optimizer step
-        self.optimizer.step()
-        
-        # Update learning rate
-        current_lr = self.scheduler.step()
-        
-        return loss.item(), current_lr, grad_norm.item()
+        return loss.item() * self.accumulation_steps, current_lr, grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
     
     def validate(self, val_dataloader: DataLoader) -> float:
         """
-        Validation step
+        Validation step with mixed precision support
         
         Args:
             val_dataloader: Validation data loader
@@ -558,28 +633,52 @@ class Trainer:
         total_loss = 0.0
         num_batches = 0
         
+        # Create progress bar
+        progress_bar = tqdm(val_dataloader, desc="Validation", leave=False)
+        
         with torch.no_grad():
-            for src, tgt in val_dataloader:
+            for src, tgt in progress_bar:
                 # Move tensors to device
                 src = src.to(self.device)
                 tgt = tgt.to(self.device)
                 
-                # Forward pass
-                logits = self.model(src, tgt)
+                if self.use_amp:
+                    # Mixed precision forward pass
+                    with autocast():
+                        logits = self.model(src, tgt)
+                        
+                        # Prepare target for loss computation
+                        tgt_input = tgt[:, :-1]
+                        tgt_output = tgt[:, 1:]
+                        
+                        # Reshape for loss computation
+                        batch_size, seq_len, vocab_size = logits.shape
+                        logits_flat = logits[:, :-1, :].contiguous().view(-1, vocab_size)
+                        targets_flat = tgt_output.contiguous().view(-1)
+                        
+                        # Compute loss
+                        loss = self.criterion(logits_flat, targets_flat)
+                else:
+                    # Regular precision forward pass
+                    logits = self.model(src, tgt)
+                    
+                    # Prepare target for loss computation
+                    tgt_input = tgt[:, :-1]
+                    tgt_output = tgt[:, 1:]
+                    
+                    # Reshape for loss computation
+                    batch_size, seq_len, vocab_size = logits.shape
+                    logits_flat = logits[:, :-1, :].contiguous().view(-1, vocab_size)
+                    targets_flat = tgt_output.contiguous().view(-1)
+                    
+                    # Compute loss
+                    loss = self.criterion(logits_flat, targets_flat)
                 
-                # Prepare target for loss computation
-                tgt_input = tgt[:, :-1]
-                tgt_output = tgt[:, 1:]
-                
-                # Reshape for loss computation
-                batch_size, seq_len, vocab_size = logits.shape
-                logits_flat = logits[:, :-1, :].contiguous().view(-1, vocab_size)
-                targets_flat = tgt_output.contiguous().view(-1)
-                
-                # Compute loss
-                loss = self.criterion(logits_flat, targets_flat)
                 total_loss += loss.item()
                 num_batches += 1
+                
+                # Update progress bar with current loss
+                progress_bar.set_postfix({'Val Loss': f'{loss.item():.4f}'})
         
         # Switch back to training mode
         self.model.train()
@@ -587,26 +686,55 @@ class Trainer:
         return total_loss / num_batches if num_batches > 0 else float('inf')
     
     def train_epoch(self, train_dataloader: DataLoader) -> tuple:
-        """Train for one epoch"""
+        """Train for one epoch with gradient accumulation support"""
         self.model.train()
         total_loss = 0.0
         total_grad_norm = 0.0
-        num_batches = len(train_dataloader)
+        num_optimizer_steps = 0
+        accumulation_loss = 0.0
         
-        for batch_idx, (src, tgt) in enumerate(train_dataloader):
-            # Training step
-            loss, lr, grad_norm = self.train_step(src, tgt)
-            
-            total_loss += loss
-            total_grad_norm += grad_norm
-            
-            # Progress update
-            if (batch_idx + 1) % 10 == 0:
-                print(f"  Batch {batch_idx + 1:4d}/{num_batches} | "
-                      f"Loss: {loss:.4f} | LR: {lr:.6f}")
+        # Create progress bar
+        progress_bar = tqdm(train_dataloader, desc="Training", leave=False)
         
-        avg_loss = total_loss / num_batches
-        avg_grad_norm = total_grad_norm / num_batches
+        for batch_idx, (src, tgt) in enumerate(progress_bar):
+            # Determine if this is an accumulation step or optimizer step
+            is_accumulation_step = (batch_idx + 1) % self.accumulation_steps != 0
+            is_last_batch = batch_idx == len(train_dataloader) - 1
+            
+            # Training step with accumulation flag
+            loss, lr, grad_norm = self.train_step(src, tgt, accumulate=is_accumulation_step and not is_last_batch)
+            
+            accumulation_loss += loss
+            
+            # If this completes an accumulation cycle or is the last batch
+            if not is_accumulation_step or is_last_batch:
+                total_loss += accumulation_loss
+                total_grad_norm += grad_norm
+                num_optimizer_steps += 1
+                
+                # Update progress bar with accumulated metrics
+                avg_accumulated_loss = accumulation_loss / min(self.accumulation_steps, (batch_idx % self.accumulation_steps) + 1)
+                progress_bar.set_postfix({
+                    'Loss': f'{avg_accumulated_loss:.4f}',
+                    'LR': f'{lr:.6f}',
+                    'Grad': f'{grad_norm:.4f}',
+                    'Step': f'{num_optimizer_steps}'
+                })
+                
+                # Reset accumulation loss
+                accumulation_loss = 0.0
+            else:
+                # For accumulation steps, just update the loss display
+                progress_bar.set_postfix({
+                    'Loss': f'{loss:.4f}',
+                    'LR': 'accumulating...',
+                    'Grad': 'accumulating...',
+                    'Step': f'{num_optimizer_steps}'
+                })
+        
+        # Calculate averages based on number of optimizer steps, not batches
+        avg_loss = total_loss / num_optimizer_steps if num_optimizer_steps > 0 else 0.0
+        avg_grad_norm = total_grad_norm / num_optimizer_steps if num_optimizer_steps > 0 else 0.0
         
         return avg_loss, avg_grad_norm
     
@@ -614,7 +742,7 @@ class Trainer:
         """Load model checkpoint"""
         epoch, best_val_loss, train_losses, val_losses, learning_rates, gradient_norms, parameter_stats = \
             self.checkpoint_manager.load_checkpoint(
-                checkpoint_path, self.model, self.optimizer, self.scheduler, self.device
+                checkpoint_path, self.model, self.optimizer, self.scheduler, self.device, self.scaler
             )
         
         # Update trainer state
@@ -665,7 +793,7 @@ class Trainer:
                 self.logger.train_losses, self.logger.val_losses,
                 self.logger.learning_rates, self.logger.gradient_norms,
                 self.logger.parameter_stats, vars(self.config),
-                is_best, self.best_val_loss
+                is_best, self.best_val_loss, self.scaler
             )
             
             # Early stopping check
@@ -707,6 +835,8 @@ def get_config():
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping value')
     parser.add_argument('--patience', type=int, default=5, help='Early stopping patience')
     parser.add_argument('--label_smoothing', type=float, default=0.1, help='Label smoothing factor')
+    parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision training')
+    parser.add_argument('--accumulation_steps', type=int, default=1, help='Gradient accumulation steps (effective batch size = batch_size * accumulation_steps)')
     
     # Decoding strategy
     parser.add_argument('--decoding_strategy', type=str, choices=['greedy', 'beam', 'topk'], 
