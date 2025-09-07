@@ -256,18 +256,20 @@ class DecoderLayer(nn.Module):
         Returns:
             Output tensor of same shape as input
         """
-        # 1. Masked self-attention sublayer with residual connection and normalization
-        attn_output, _ = self.self_attention(x, x, x, self_attention_mask)
-        x = self.norm1(x + self.dropout(attn_output))
+        # 1. Pre-LN: Masked self-attention sublayer
+        norm_x = self.norm1(x)
+        attn_output, _ = self.self_attention(norm_x, norm_x, norm_x, self_attention_mask)
+        x = x + self.dropout(attn_output)
         
-        # 2. Cross-attention sublayer with residual connection and normalization
-        # Query: x (decoder), Key/Value: encoder_output
-        cross_attn_output, _ = self.cross_attention(x, encoder_output, encoder_output, cross_attention_mask)
-        x = self.norm2(x + self.dropout(cross_attn_output))
+        # 2. Pre-LN: Cross-attention sublayer
+        norm_x = self.norm2(x)
+        cross_attn_output, _ = self.cross_attention(norm_x, encoder_output, encoder_output, cross_attention_mask)
+        x = x + self.dropout(cross_attn_output)
         
-        # 3. Feedforward sublayer with residual connection and normalization
-        ff_output = self.feedforward(x)
-        x = self.norm3(x + self.dropout(ff_output))
+        # 3. Pre-LN: Feedforward sublayer
+        norm_x = self.norm3(x)
+        ff_output = self.feedforward(norm_x)
+        x = x + self.dropout(ff_output)
         
         return x
 

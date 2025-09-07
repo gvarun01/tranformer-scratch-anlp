@@ -248,19 +248,21 @@ class EncoderLayer(nn.Module):
         Returns:
             Output tensor of same shape as input
         """
-        # Self-attention sublayer with residual connection and normalization
-        # 1. Multi-head self-attention
-        attn_output, _ = self.self_attention(x, x, x, mask)
+        # Pre-LN: Self-attention sublayer with residual connection
+        # 1. Normalize, then apply multi-head self-attention
+        norm_x = self.norm1(x)
+        attn_output, _ = self.self_attention(norm_x, norm_x, norm_x, mask)
         
-        # 2. Add residual connection and apply layer normalization
-        x = self.norm1(x + self.dropout(attn_output))
+        # 2. Add residual connection
+        x = x + self.dropout(attn_output)
         
-        # Feedforward sublayer with residual connection and normalization
-        # 3. Feedforward network
-        ff_output = self.feedforward(x)
+        # Pre-LN: Feedforward sublayer with residual connection
+        # 3. Normalize, then apply feedforward network
+        norm_x = self.norm2(x)
+        ff_output = self.feedforward(norm_x)
         
-        # 4. Add residual connection and apply layer normalization
-        x = self.norm2(x + self.dropout(ff_output))
+        # 4. Add residual connection
+        x = x + self.dropout(ff_output)
         
         return x
 

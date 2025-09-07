@@ -111,49 +111,6 @@ class DecodingEngine:
             raise ValueError(f"Unsupported decoding strategy: {strategy}")
             
         return self.postprocess_target(output_tokens.squeeze().tolist())
-            
-            # Initialize target sequence with BOS token
-            tgt_sequence = [self.bos_id]
-            tgt_tensor = torch.tensor([tgt_sequence], dtype=torch.long).to(self.device)
-            
-            log_probs = []
-            
-            for step in range(self.max_len):
-                # Create target mask
-                tgt_mask = create_combined_mask(tgt_tensor, self.pad_id)
-                
-                # Decode
-                logits = self.model.decode(tgt_tensor, encoder_output, tgt_mask)
-                
-                # Get logits for the last position
-                next_token_logits = logits[0, -1, :]  # (vocab_size,)
-                
-                # Apply softmax to get probabilities
-                probs = F.softmax(next_token_logits, dim=-1)
-                
-                # Greedy selection: argmax
-                next_token_id = torch.argmax(probs).item()
-                
-                # Store log probability
-                log_probs.append(torch.log(probs[next_token_id]).item())
-                
-                # Add to sequence
-                tgt_sequence.append(next_token_id)
-                
-                # Update tensor
-                tgt_tensor = torch.tensor([tgt_sequence], dtype=torch.long).to(self.device)
-                
-                # Check if EOS token is generated
-                if next_token_id == self.eos_id:
-                    break
-            
-            # Calculate average log probability
-            avg_log_prob = sum(log_probs) / len(log_probs) if log_probs else 0.0
-            
-            # Convert to text
-            decoded_text = self.postprocess_target(tgt_sequence)
-            
-            return decoded_text, avg_log_prob
     
     def beam_search_decode(self, src_text: str, beam_size: int = 5) -> Tuple[str, float]:
         """
@@ -729,10 +686,6 @@ def main():
             reference_sentences = reference_sentences[:100]
         
         # Compare strategies
-        compare_strategies(engine, test_sentences, reference_sentences)
-
-if __name__ == '__main__':
-    main()
         results = compare_strategies(engine, test_sentences, reference_sentences)
         
         # Print comparison table
