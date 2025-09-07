@@ -6,8 +6,7 @@ __pycache__/
 # C extensions
 *.so
 transformer_env/
-models/
-data/
+
 
 # Distribution / packaging
 .Python
@@ -208,3 +207,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project-specific
+data/prepared/
+models/
+transformer_env/
+*.png
+*.json
