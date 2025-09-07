@@ -209,7 +209,6 @@ marimo/_lsp/
 __marimo__/
 
 # Project-specific
-data/prepared/
 models/
 transformer_env/
 *.png

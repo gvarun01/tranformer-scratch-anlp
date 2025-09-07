@@ -61,13 +61,13 @@ def split_data(src_file: str, tgt_file: str, output_dir: str, test_size: float =
     
     # Split into train+val and test
     src_train_val, src_test, tgt_train_val, tgt_test = train_test_split(
-        src_lines, tgt_lines, test_size=test_size, random_state=42
+        src_lines, tgt_lines, test_size=test_size, random_state=42, shuffle=False
     )
     
     # Split train+val into train and val
     val_size_adjusted = val_size / (1 - test_size)
     src_train, src_val, tgt_train, tgt_val = train_test_split(
-        src_train_val, tgt_train_val, test_size=val_size_adjusted, random_state=42
+        src_train_val, tgt_train_val, test_size=val_size_adjusted, random_state=42, shuffle=False
     )
     
     # Create output directory if it doesn't exist

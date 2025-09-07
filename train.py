@@ -436,30 +436,19 @@ class LabelSmoothingLoss(nn.Module):
         log_probs = torch.log_softmax(logits, dim=-1)
         
         # Create smoothed target distribution
-        # (1 - smoothing) for the true label, and smoothing / (vocab_size - 2) for others
-        # We subtract 2 to account for the true label and the padding token
-        
-        # Create a tensor of shape (vocab_size) with smoothed probabilities
-        true_dist = torch.full_like(log_probs, self.smoothing / (self.vocab_size - 2))
+        true_dist = torch.full_like(log_probs, self.smoothing / (self.vocab_size - 1))
         
         # Fill the true label positions with (1 - smoothing)
         true_dist.scatter_(1, targets.unsqueeze(1), 1 - self.smoothing)
         
-        # Set padding token probability to 0
-        true_dist[:, self.pad_idx] = 0
-        
-        # Create a mask for padding tokens
-        mask = torch.nonzero(targets == self.pad_idx)
-        if mask.dim() > 0:
-            true_dist.index_fill_(0, mask.squeeze(), 0.0)
-        
-        # Compute KL divergence loss
-        loss = self.criterion(log_probs, true_dist)
+        # Create a mask for padding tokens and apply it
+        non_pad_mask = (targets != self.pad_idx)
+        loss = self.criterion(log_probs[non_pad_mask], true_dist[non_pad_mask])
         
         # Normalize loss by the number of non-padding tokens
-        non_pad_tokens = (targets != self.pad_idx).sum()
+        num_non_pad_tokens = non_pad_mask.sum()
         
-        return loss / non_pad_tokens
+        return loss / num_non_pad_tokens
 
 class Trainer:
     """Refactored training class for Transformer model"""

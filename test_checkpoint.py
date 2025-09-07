@@ -16,6 +16,26 @@ class SPMWrapper:
     def __init__(self, sp_model):
         self.sp = sp_model
         self.vocab_size = len(sp_model)
+        
+        # Get actual special token IDs from the SentencePiece model
+        pad_id = self.sp.pad_id() if self.sp.pad_id() != -1 else 0
+        unk_id = self.sp.unk_id() if self.sp.unk_id() != -1 else 1
+        bos_id = self.sp.bos_id() if self.sp.bos_id() != -1 else 2
+        eos_id = self.sp.eos_id() if self.sp.eos_id() != -1 else 3
+        
+        # Create token2id mapping for special tokens expected by DecodingEngine
+        self.token2id = {
+            "<pad>": pad_id,    # PAD_TOKEN
+            "<bos>": bos_id,    # BOS_TOKEN
+            "<eos>": eos_id,    # EOS_TOKEN
+            "<unk>": unk_id,    # UNK_TOKEN
+        }
+        
+        print(f"SPMWrapper special token mapping:")
+        print(f"  <pad>: {self.token2id['<pad>']}")
+        print(f"  <bos>: {self.token2id['<bos>']}")
+        print(f"  <eos>: {self.token2id['<eos>']}")
+        print(f"  <unk>: {self.token2id['<unk>']}")
     
     def __len__(self):
         return self.vocab_size
@@ -43,8 +63,8 @@ def load_model_and_vocabs(model_path: str, config_path: str, src_vocab_path: str
     decoder_weight_shape = checkpoint['model_state_dict']['decoder.output_projection.weight'].shape
     actual_tgt_vocab_size = decoder_weight_shape[0]  # Output vocab size
     
-    # Get source vocab size from encoder embedding
-    encoder_weight_shape = checkpoint['model_state_dict']['encoder.embedding.weight'].shape
+    # Get source vocab size from encoder token embedding
+    encoder_weight_shape = checkpoint['model_state_dict']['encoder.token_embedding.embedding.weight'].shape
     actual_src_vocab_size = encoder_weight_shape[0]  # Input vocab size
     
     print(f"Detected vocab sizes from checkpoint:")
@@ -70,7 +90,7 @@ def load_model_and_vocabs(model_path: str, config_path: str, src_vocab_path: str
         max_seq_len=config['max_seq_len'],
         dropout=config['dropout'],
         pos_encoding=config['pos_encoding'],
-        pad_idx=0
+        pad_idx=tgt_vocab.token2id["<pad>"]  # Use actual pad_id from SentencePiece
     )
     
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -81,7 +101,7 @@ def load_model_and_vocabs(model_path: str, config_path: str, src_vocab_path: str
 
 def main():
     parser = argparse.ArgumentParser(description='Test a Transformer checkpoint.')
-    parser.add_argument('--checkpoint', type=str, default='models/rope/checkpoint_epoch_1_virat.pt', help='Path to the model checkpoint.')
+    parser.add_argument('--checkpoint', type=str, default='models/rope/checkpoint_epoch_4.pt', help='Path to the model checkpoint.')
     parser.add_argument('--config', type=str, default='models/rope/config.json', help='Path to the model config.')
     parser.add_argument('--src_vocab', type=str, default='models/spm_fi.model', help='Path to the source vocabulary.')
     parser.add_argument('--tgt_vocab', type=str, default='models/spm_en.model', help='Path to the target vocabulary.')

@@ -306,14 +306,7 @@ def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tens
     
     # Apply mask if provided (True values are masked out)
     if mask is not None:
-        # Expand mask to match scores shape if needed
-        if mask.dim() == 2:  # (seq_len, seq_len)
-            mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
-        elif mask.dim() == 3:  # (batch_size, 1, seq_len)
-            mask = mask.unsqueeze(1)  # (batch_size, 1, 1, seq_len)
-        
-        # Apply mask: set masked positions to large negative value
-        scores = scores.masked_fill(mask, -1e9)
+        scores = scores.masked_fill(mask == 0, -1e9)
     
     # Apply softmax to get attention weights
     attention_weights = F.softmax(scores, dim=-1)
@@ -631,7 +624,7 @@ def create_look_ahead_mask(size: int, device: torch.device) -> torch.Tensor:
         A look-ahead mask tensor of shape (1, 1, size, size) where False means mask out.
     """
     mask = torch.triu(torch.ones(size, size, device=device), diagonal=1)
-    return (mask == 0).unsqueeze(0).unsqueeze(0)  # True for valid positions, False for future positions
+    return mask == 0  # True for valid positions, False for future positions
 
 def create_combined_mask(seq: torch.Tensor, pad_idx: int = 0) -> torch.Tensor:
     """
@@ -644,12 +637,14 @@ def create_combined_mask(seq: torch.Tensor, pad_idx: int = 0) -> torch.Tensor:
     Returns:
         A combined mask tensor where False means mask out.
     """
+    seq_len = seq.shape[1]
     padding_mask = create_padding_mask(seq, pad_idx)  # (batch_size, 1, 1, seq_len)
-    look_ahead_mask = create_look_ahead_mask(seq.shape[1], seq.device)  # (1, 1, seq_len, seq_len)
+    look_ahead_mask = create_look_ahead_mask(seq_len, seq.device)  # (seq_len, seq_len)
     
     # Combine masks for decoder self-attention
     # A position can be attended to if it is not a padding token AND not a future token.
-    combined_mask = padding_mask & look_ahead_mask
+    # The look_ahead_mask is broadcast across the batch dimension.
+    combined_mask = padding_mask & look_ahead_mask.unsqueeze(0)
     return combined_mask
 
 # Initialize global preprocessor
@@ -661,16 +656,26 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """
-    Applies rotary positional embeddings to the input tensor.
+    """Applies rotary positional embedding to a tensor.
+    
     Args:
-        x: Input tensor of shape (batch_size, num_heads, seq_len, d_k)
-        cos: Cosine embeddings of shape (1, 1, seq_len, d_k)
-        sin: Sine embeddings of shape (1, 1, seq_len, d_k)
+        x (torch.Tensor): Input tensor of shape (batch_size, num_heads, seq_len, d_k).
+        cos (torch.Tensor): Cosine part of the embedding of shape (1, 1, max_seq_len, d_k).
+        sin (torch.Tensor): Sine part of the embedding of shape (1, 1, max_seq_len, d_k).
+        
     Returns:
-        Tensor with applied rotary embeddings.
+        torch.Tensor: Tensor with rotary positional embedding applied.
     """
-    return (x * cos) + (_rotate_half(x) * sin)
+    # Get seq_len from input tensor
+    seq_len = x.shape[2]
+    
+    # Adjust cos and sin tensors to match the sequence length of the input
+    cos = cos[:, :, :seq_len, :]
+    sin = sin[:, :, :seq_len, :]
+
+    # Apply rotary embeddings
+    x_rotated = _rotate_half(x)
+    return x * cos + x_rotated * sin
 
 def greedy_decode(model, src_tensor, src_mask, max_len, start_symbol, end_symbol, device):
     """
@@ -683,8 +688,15 @@ def greedy_decode(model, src_tensor, src_mask, max_len, start_symbol, end_symbol
         tgt_tokens = torch.full((src_tensor.size(0), 1), start_symbol, dtype=torch.long, device=device)
 
         for _ in range(max_len - 1):
-            tgt_mask = model.create_tgt_mask(tgt_tokens).to(device)
-            output = model.decoder(tgt_tokens, encoder_output, tgt_mask, src_mask)
+            tgt_mask = create_combined_mask(tgt_tokens, model.pad_idx).to(device)
+            
+            # Create cross-attention mask by expanding src_mask to target length
+            # src_mask: (batch_size, 1, 1, src_len)
+            # We need: (batch_size, 1, tgt_len, src_len)
+            tgt_len = tgt_tokens.size(1)
+            cross_attn_mask = src_mask.expand(-1, -1, tgt_len, -1)
+            
+            output = model.decoder(tgt_tokens, encoder_output, tgt_mask, cross_attn_mask)
             
             # Get the token with the highest probability
             pred_token = output.argmax(2)[:, -1]
@@ -748,7 +760,7 @@ def top_k_sampling_decode(model, src_tensor, src_mask, max_len, start_symbol, en
         tgt_tokens = torch.full((src_tensor.size(0), 1), start_symbol, dtype=torch.long, device=device)
 
         for _ in range(max_len - 1):
-            tgt_mask = model.create_tgt_mask(tgt_tokens).to(device)
+            tgt_mask = create_combined_mask(tgt_tokens, model.pad_idx).to(device)
             output = model.decoder(tgt_tokens, encoder_output, tgt_mask, src_mask)
             
             # Get the logits for the last token

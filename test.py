@@ -55,12 +55,11 @@ class DecodingEngine:
     
     def preprocess_source(self, src_text: str) -> torch.Tensor:
         """Preprocess source text and convert to tensor"""
-        # Clean and tokenize
-        cleaned_text = text_preprocessor.preprocess_text(src_text, add_special_tokens=True)
-        tokens = cleaned_text.split()
+        # Clean the text but don't add special tokens here
+        cleaned_text = text_preprocessor.preprocess_text(src_text, add_special_tokens=False)
         
-        # Convert to IDs
-        token_ids = self.src_vocab.encode(tokens)
+        # Encode with SentencePiece (which will add BOS/EOS internally)
+        token_ids = self.src_vocab.encode(cleaned_text)
         
         # Convert to tensor and add batch dimension
         src_tensor = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(self.device)
@@ -77,11 +76,8 @@ class DecodingEngine:
             if token_id not in [self.pad_id, self.bos_id]:
                 filtered_ids.append(token_id)
         
-        # Convert to tokens
-        tokens = self.tgt_vocab.decode(filtered_ids)
-        
-        # Join tokens
-        text = " ".join(tokens)
+        # Convert IDs to text using SentencePiece
+        text = self.tgt_vocab.decode(filtered_ids)
         
         return text
     
