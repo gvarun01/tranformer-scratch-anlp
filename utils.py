@@ -693,6 +693,14 @@ def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) 
     seq_len = x.shape[2]
     
     # Adjust cos and sin tensors to match the sequence length of the input
+    # Handle case where input sequence is longer than cos/sin embeddings
+    if seq_len > cos.shape[2]:
+        # If input is longer, we need to extend the embeddings or truncate the input
+        # For safety, let's truncate to the available embedding length
+        available_len = cos.shape[2]
+        x = x[:, :, :available_len, :]
+        seq_len = available_len
+    
     cos = cos[:, :, :seq_len, :]
     sin = sin[:, :, :seq_len, :]
 

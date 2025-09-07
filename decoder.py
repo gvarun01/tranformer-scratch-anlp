@@ -130,10 +130,22 @@ class MultiHeadAttention(nn.Module):
         V = self._split_heads(self.W_v(V))
         
         if self.pos_encoding == 'rope':
-            seq_len = Q.size(2)
-            cos, sin = self.rope.get_embeddings(seq_len, Q.device)
-            Q = apply_rotary_pos_emb(Q, cos, sin)
-            K = apply_rotary_pos_emb(K, cos, sin)
+            # For self-attention, Q and K have the same sequence length
+            # For cross-attention, Q and K may have different sequence lengths
+            q_seq_len = Q.size(2)
+            k_seq_len = K.size(2)
+            
+            # Apply RoPE to Q with its sequence length
+            q_cos, q_sin = self.rope.get_embeddings(q_seq_len, Q.device)
+            Q = apply_rotary_pos_emb(Q, q_cos, q_sin)
+            
+            # Apply RoPE to K with its sequence length (if different from Q)
+            if k_seq_len != q_seq_len:
+                k_cos, k_sin = self.rope.get_embeddings(k_seq_len, K.device)
+                K = apply_rotary_pos_emb(K, k_cos, k_sin)
+            else:
+                # Same sequence length, use same embeddings
+                K = apply_rotary_pos_emb(K, q_cos, q_sin)
         
         relative_bias = None
         if self.pos_encoding == 'relative_bias':
