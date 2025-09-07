@@ -273,6 +273,29 @@ class RelativePositionBias(nn.Module):
         
         return scores_with_bias
 
+def safe_masked_fill(tensor: torch.Tensor, mask: torch.Tensor, value: float) -> torch.Tensor:
+    """
+    Safely apply masked_fill with dtype-appropriate values
+    
+    Args:
+        tensor: Input tensor
+        mask: Boolean mask
+        value: Value to fill (will be adjusted for tensor dtype)
+    
+    Returns:
+        Tensor with mask applied
+    """
+    if tensor.dtype == torch.float16:
+        # Use smaller values for half precision to avoid overflow
+        if value < 0:
+            safe_value = -65504.0  # Close to the minimum for float16
+        else:
+            safe_value = 65504.0   # Close to the maximum for float16
+    else:
+        safe_value = value
+    
+    return tensor.masked_fill(mask, safe_value)
+
 def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, 
                                  mask: Optional[torch.Tensor] = None,
                                  relative_bias: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -306,7 +329,7 @@ def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tens
     
     # Apply mask if provided (True values are masked out)
     if mask is not None:
-        scores = scores.masked_fill(mask == 0, -1e9)
+        scores = safe_masked_fill(scores, mask == 0, -1e9)
     
     # Apply softmax to get attention weights
     attention_weights = F.softmax(scores, dim=-1)

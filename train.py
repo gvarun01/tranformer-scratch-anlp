@@ -10,7 +10,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
+from torch import autocast
 from encoder import Encoder
 from decoder import Decoder
 from utils import create_padding_mask, create_combined_mask, TranslationDataset, create_dataloader
@@ -550,7 +551,7 @@ class Trainer:
         
         if self.use_amp:
             # Mixed precision forward pass
-            with autocast():
+            with autocast('cuda'):
                 logits = self.model(src, tgt)
                 
                 # Prepare target for loss computation
@@ -644,7 +645,7 @@ class Trainer:
                 
                 if self.use_amp:
                     # Mixed precision forward pass
-                    with autocast():
+                    with autocast('cuda'):
                         logits = self.model(src, tgt)
                         
                         # Prepare target for loss computation
