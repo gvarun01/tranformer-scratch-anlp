@@ -7,12 +7,13 @@
   "learning_rate": 1e-4,
   "batch_size": 32,
   "num_epochs": 100,
-  "max_len": 512,
+  "max_len": 128,
   "decoding_strategy": "greedy",
   "pos_encoding": "rope",
   "data_dir": "data/",
   "model_dir": "models/",
   "warmup_steps": 4000,
   "grad_clip": 1.0,
-  "save_every": 10
+  "save_every": 10,
+  "patience": 5
 }

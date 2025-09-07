@@ -1,6 +1,5 @@
 # utils.py - Helper functions for Transformer from scratch
-# This file will contain utility functions without using torch.nn.Transformer modules
-
+# This file will contain utility functions without using torch.nn.Transformer
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -104,34 +103,32 @@ class RoPE(nn.Module):
         # Rotate: [x1, x2] -> [-x2, x1]
         return torch.cat([-x2, x1], dim=-1)
     
-    def forward(self, x: torch.Tensor, seq_len: Optional[int] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Apply RoPE to input tensor
         
         Args:
-            x: Input tensor of shape (batch_size, seq_len, d_model)
-            seq_len: Optional sequence length (if different from x.size(1))
+            x: Input tensor of shape (batch_size, num_heads, seq_len, d_k)
         
         Returns:
             Tensor with RoPE applied, same shape as input
         """
-        if seq_len is None:
-            seq_len = x.size(1)
+        seq_len = x.size(2)
         
         # Ensure sequence length doesn't exceed max_seq_len
         if seq_len > self.max_seq_len:
             raise ValueError(f"Sequence length {seq_len} exceeds max_seq_len {self.max_seq_len}")
         
         # Get sin and cos embeddings for current sequence length
-        sin_emb = self.sin_embeddings[:seq_len]  # (seq_len, d_model//2)
-        cos_emb = self.cos_embeddings[:seq_len]  # (seq_len, d_model//2)
+        sin_emb = self.sin_embeddings[:seq_len, :]  # (seq_len, d_model//2)
+        cos_emb = self.cos_embeddings[:seq_len, :]  # (seq_len, d_model//2)
         
         # Expand to match input dimensions
-        # (seq_len, d_model//2) -> (1, seq_len, d_model//2)
-        sin_emb = sin_emb.unsqueeze(0)
-        cos_emb = cos_emb.unsqueeze(0)
+        # (seq_len, d_model//2) -> (1, 1, seq_len, d_model//2)
+        sin_emb = sin_emb.unsqueeze(0).unsqueeze(1)
+        cos_emb = cos_emb.unsqueeze(0).unsqueeze(1)
         
-        # Interleave sin and cos to match d_model dimension
+        # Interleave sin and cos to match d_k dimension
         # [sin_0, cos_0, sin_1, cos_1, ...]
         sin_interleaved = sin_emb.repeat_interleave(2, dim=-1)
         cos_interleaved = cos_emb.repeat_interleave(2, dim=-1)
@@ -140,6 +137,37 @@ class RoPE(nn.Module):
         rotated = x * cos_interleaved + self._rotate_half(x) * sin_interleaved
         
         return rotated
+    
+    def get_embeddings(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get cos and sin embeddings for a given sequence length.
+        
+        Args:
+            seq_len: Sequence length
+            device: Device to create tensors on
+            
+        Returns:
+            Tuple of (cos, sin) embeddings of shape (1, 1, seq_len, d_model)
+        """
+        # Ensure sequence length doesn't exceed max_seq_len
+        if seq_len > self.max_seq_len:
+            raise ValueError(f"Sequence length {seq_len} exceeds max_seq_len {self.max_seq_len}")
+        
+        # Get sin and cos embeddings for current sequence length
+        sin_emb = self.sin_embeddings[:seq_len, :]  # (seq_len, d_model//2)
+        cos_emb = self.cos_embeddings[:seq_len, :]  # (seq_len, d_model//2)
+        
+        # Expand to match input dimensions
+        # (seq_len, d_model//2) -> (1, 1, seq_len, d_model//2)
+        sin_emb = sin_emb.unsqueeze(0).unsqueeze(1)
+        cos_emb = cos_emb.unsqueeze(0).unsqueeze(1)
+        
+        # Interleave sin and cos to match d_model dimension
+        # [sin_0, cos_0, sin_1, cos_1, ...]
+        sin_interleaved = sin_emb.repeat_interleave(2, dim=-1)
+        cos_interleaved = cos_emb.repeat_interleave(2, dim=-1)
+        
+        return cos_interleaved.to(device), sin_interleaved.to(device)
     
     def apply_rope_to_qk(self, Q: torch.Tensor, K: torch.Tensor, 
                          seq_len: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -172,75 +200,54 @@ class RoPE(nn.Module):
         return Q_rope, K_rope
 
 class RelativePositionBias(nn.Module):
-    """Relative Position Bias for positional encoding"""
+    """Relative Position Bias for Transformer attention"""
     
-    def __init__(self, max_seq_len: int = 2048, num_heads: int = 8, 
-                 max_relative_distance: int = 128):
+    def __init__(self, max_seq_len: int, num_heads: int):
         """
         Args:
             max_seq_len: Maximum sequence length
             num_heads: Number of attention heads
-            max_relative_distance: Maximum relative distance to consider
         """
         super().__init__()
         self.max_seq_len = max_seq_len
         self.num_heads = num_heads
-        self.max_relative_distance = max_relative_distance
         
-        # Create relative position bias table
-        # Shape: (2 * max_relative_distance + 1, num_heads)
-        self.relative_attention_bias = nn.Embedding(
-            2 * max_relative_distance + 1, num_heads
-        )
+        # Create learnable embeddings for relative positions
+        # The range of relative positions is [-max_seq_len+1, max_seq_len-1]
+        num_relative_positions = 2 * max_seq_len - 1
+        self.relative_attention_bias = nn.Embedding(num_relative_positions, num_heads)
         
         # Initialize weights
         self._init_weights()
-    
+        
     def _init_weights(self):
-        """Initialize relative position bias weights"""
-        nn.init.normal_(self.relative_attention_bias.weight, mean=0.0, std=0.02)
-    
-    def _get_relative_positions(self, seq_len: int) -> torch.Tensor:
-        """Get relative position indices for a given sequence length"""
-        # Create position indices
-        positions = torch.arange(seq_len, dtype=torch.long)
+        """Initialize embedding weights"""
+        nn.init.xavier_uniform_(self.relative_attention_bias.weight)
         
-        # Create relative position matrix
-        # Shape: (seq_len, seq_len)
-        relative_positions = positions.unsqueeze(1) - positions.unsqueeze(0)
-        
-        # Clip relative positions to max_relative_distance
-        relative_positions = torch.clamp(
-            relative_positions, 
-            -self.max_relative_distance, 
-            self.max_relative_distance
-        )
-        
-        # Shift to non-negative indices for embedding lookup
-        relative_positions += self.max_relative_distance
-        
-        return relative_positions
-    
     def forward(self, seq_len: int) -> torch.Tensor:
         """
-        Get relative position bias for attention scores
+        Create the bias tensor for a given sequence length.
         
         Args:
-            seq_len: Sequence length
-        
+            seq_len: The sequence length of the input.
+            
         Returns:
-            Relative position bias tensor of shape (1, num_heads, seq_len, seq_len)
+            A bias tensor of shape (1, num_heads, seq_len, seq_len)
         """
-        # Get relative position indices
-        relative_positions = self._get_relative_positions(seq_len)
+        # Create a matrix of relative positions
+        positions = torch.arange(seq_len, device=self.relative_attention_bias.weight.device)
+        relative_positions = positions.unsqueeze(1) - positions.unsqueeze(0)
         
-        # Lookup relative position bias
+        # Shift relative positions to be non-negative (0 to 2*seq_len-2)
+        relative_positions = relative_positions + seq_len - 1
+        
+        # Get the bias from the embedding table
         # Shape: (seq_len, seq_len, num_heads)
         bias = self.relative_attention_bias(relative_positions)
         
-        # Transpose to match attention score shape
-        # Shape: (1, num_heads, seq_len, seq_len)
-        bias = bias.transpose(0, 2).unsqueeze(0)
+        # Reshape for broadcasting with attention scores
+        # (seq_len, seq_len, num_heads) -> (num_heads, seq_len, seq_len) -> (1, num_heads, seq_len, seq_len)
+        bias = bias.permute(2, 0, 1).unsqueeze(0)
         
         return bias
     
@@ -267,7 +274,8 @@ class RelativePositionBias(nn.Module):
         return scores_with_bias
 
 def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, 
-                                mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+                                 mask: Optional[torch.Tensor] = None,
+                                 relative_bias: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """Scaled dot-product attention mechanism
     
     Args:
@@ -275,6 +283,7 @@ def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tens
         K: Key tensor of shape (batch_size, num_heads, seq_len, d_k)
         V: Value tensor of shape (batch_size, num_heads, seq_len, d_k)
         mask: Optional mask tensor to mask out certain positions
+        relative_bias: Optional relative position bias tensor
     
     Returns:
         Tuple of (output, attention_weights)
@@ -290,6 +299,10 @@ def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tens
     
     # Scale by sqrt(d_k)
     scores = scores / math.sqrt(d_k)
+
+    # Add relative position bias if provided
+    if relative_bias is not None:
+        scores += relative_bias
     
     # Apply mask if provided (True values are masked out)
     if mask is not None:
@@ -454,14 +467,14 @@ class TranslationDataset(Dataset):
     """Dataset for Finnish-English translation pairs"""
     
     def __init__(self, src_texts: List[str], tgt_texts: List[str], 
-                 src_vocab: Vocabulary, tgt_vocab: Vocabulary, 
+                 src_vocab, tgt_vocab, 
                  max_len: int = 512, pad_idx: int = 0):
         """
         Args:
             src_texts: List of source (Finnish) texts
             tgt_texts: List of target (English) texts
-            src_vocab: Source vocabulary
-            tgt_vocab: Target vocabulary
+            src_vocab: Source vocabulary (can be Vocabulary or SPMWrapper)
+            tgt_vocab: Target vocabulary (can be Vocabulary or SPMWrapper)
             max_len: Maximum sequence length
             pad_idx: Padding token index
         """
@@ -472,13 +485,20 @@ class TranslationDataset(Dataset):
         self.max_len = max_len
         self.pad_idx = pad_idx
         
-        # Preprocess and tokenize all texts
-        self.src_tokens = self._preprocess_texts(src_texts)
-        self.tgt_tokens = self._preprocess_texts(tgt_texts)
+        # Check if using SentencePiece (SPMWrapper) or traditional vocabulary
+        self.use_spm = hasattr(src_vocab, 'sp')
         
-        # Convert to IDs
-        self.src_ids = [src_vocab.encode(tokens) for tokens in self.src_tokens]
-        self.tgt_ids = [tgt_vocab.encode(tokens) for tokens in self.tgt_tokens]
+        if self.use_spm:
+            # For SentencePiece, encode texts directly
+            self.src_ids = [src_vocab.encode(text.strip()) for text in src_texts]
+            self.tgt_ids = [tgt_vocab.encode(text.strip()) for text in tgt_texts]
+        else:
+            # For traditional vocabulary, preprocess and tokenize first
+            self.src_tokens = self._preprocess_texts(src_texts)
+            self.tgt_tokens = self._preprocess_texts(tgt_texts)
+            # Convert to IDs
+            self.src_ids = [src_vocab.encode(tokens) for tokens in self.src_tokens]
+            self.tgt_ids = [tgt_vocab.encode(tokens) for tokens in self.tgt_tokens]
     
     def _preprocess_texts(self, texts: List[str]) -> List[List[str]]:
         """Preprocess and tokenize texts"""
@@ -593,54 +613,164 @@ def create_padding_mask(seq: torch.Tensor, pad_idx: int) -> torch.Tensor:
         pad_idx: Index of padding token
     
     Returns:
-        Mask tensor of shape (batch_size, 1, 1, seq_len) where True means mask out
+        Mask tensor of shape (batch_size, 1, 1, seq_len) where False means mask out
     """
-    # Create mask: True where seq == pad_idx (should be masked)
-    mask = (seq == pad_idx).unsqueeze(1).unsqueeze(2)  # (batch_size, 1, 1, seq_len)
+    # Create mask: False where seq == pad_idx (should be masked), True where valid
+    mask = (seq != pad_idx).unsqueeze(1).unsqueeze(2)  # (batch_size, 1, 1, seq_len)
     return mask
 
-def create_look_ahead_mask(size: int) -> torch.Tensor:
-    """Create look-ahead mask to prevent decoder from attending to future tokens
+def create_look_ahead_mask(size: int, device: torch.device) -> torch.Tensor:
+    """
+    Create a look-ahead mask for decoding.
     
     Args:
-        size: Size of the sequence
-    
+        size: The sequence length.
+        device: The device to create the tensor on.
+        
     Returns:
-        Upper triangular mask tensor of shape (size, size) where True means mask out
+        A look-ahead mask tensor of shape (1, 1, size, size) where False means mask out.
     """
-    # Create upper triangular matrix (including diagonal)
-    mask = torch.triu(torch.ones(size, size), diagonal=1)
-    
-    # Convert to boolean: True means mask out (should not attend)
-    mask = mask.bool()
-    
-    return mask
+    mask = torch.triu(torch.ones(size, size, device=device), diagonal=1)
+    return (mask == 0).unsqueeze(0).unsqueeze(0)  # True for valid positions, False for future positions
 
-def create_combined_mask(seq: torch.Tensor, pad_idx: int) -> torch.Tensor:
-    """Create combined mask for decoder (padding + look-ahead)
+def create_combined_mask(seq: torch.Tensor, pad_idx: int = 0) -> torch.Tensor:
+    """
+    Create a combined mask for the decoder, including padding and look-ahead.
     
     Args:
-        seq: Input sequence tensor of shape (batch_size, seq_len)
-        pad_idx: Index of padding token
-    
+        seq: The target sequence tensor of shape (batch_size, seq_len).
+        pad_idx: The padding token index.
+        
     Returns:
-        Combined mask tensor of shape (batch_size, 1, seq_len, seq_len)
+        A combined mask tensor where False means mask out.
     """
-    batch_size, seq_len = seq.shape
-    
-    # Create padding mask
     padding_mask = create_padding_mask(seq, pad_idx)  # (batch_size, 1, 1, seq_len)
+    look_ahead_mask = create_look_ahead_mask(seq.shape[1], seq.device)  # (1, 1, seq_len, seq_len)
     
-    # Create look-ahead mask
-    look_ahead_mask = create_look_ahead_mask(seq_len)  # (seq_len, seq_len)
-    
-    # Expand look-ahead mask to batch dimension
-    look_ahead_mask = look_ahead_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
-    
-    # Combine masks: True means mask out (should not attend)
-    combined_mask = padding_mask | look_ahead_mask
-    
+    # Combine masks for decoder self-attention
+    # A position can be attended to if it is not a padding token AND not a future token.
+    combined_mask = padding_mask & look_ahead_mask
     return combined_mask
 
 # Initialize global preprocessor
 text_preprocessor = TextPreprocessor()
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Helper function to rotate half of the dimensions"""
+    x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """
+    Applies rotary positional embeddings to the input tensor.
+    Args:
+        x: Input tensor of shape (batch_size, num_heads, seq_len, d_k)
+        cos: Cosine embeddings of shape (1, 1, seq_len, d_k)
+        sin: Sine embeddings of shape (1, 1, seq_len, d_k)
+    Returns:
+        Tensor with applied rotary embeddings.
+    """
+    return (x * cos) + (_rotate_half(x) * sin)
+
+def greedy_decode(model, src_tensor, src_mask, max_len, start_symbol, end_symbol, device):
+    """
+    Greedy decoding for translation.
+    """
+    model.eval()
+    with torch.no_grad():
+        encoder_output = model.encoder(src_tensor, src_mask)
+        # Start with the start-of-sequence token
+        tgt_tokens = torch.full((src_tensor.size(0), 1), start_symbol, dtype=torch.long, device=device)
+
+        for _ in range(max_len - 1):
+            tgt_mask = model.create_tgt_mask(tgt_tokens).to(device)
+            output = model.decoder(tgt_tokens, encoder_output, tgt_mask, src_mask)
+            
+            # Get the token with the highest probability
+            pred_token = output.argmax(2)[:, -1]
+            
+            # Append the predicted token
+            tgt_tokens = torch.cat((tgt_tokens, pred_token.unsqueeze(1)), dim=1)
+
+            # Stop if all sequences have generated the end token
+            if (pred_token == end_symbol).all():
+                break
+                
+    return tgt_tokens
+
+def beam_search_decode(model, src_tensor, src_mask, max_len, start_symbol, end_symbol, device, beam_width=3):
+    """
+    Beam search decoding for translation.
+    """
+    model.eval()
+    with torch.no_grad():
+        encoder_output = model.encoder(src_tensor, src_mask)
+        
+        # Initialize beams
+        # Each beam is a tuple of (sequence, score)
+        beams = [(torch.full((1, 1), start_symbol, dtype=torch.long, device=device), 0.0)]
+        
+        for _ in range(max_len - 1):
+            new_beams = []
+            for seq, score in beams:
+                if seq[0, -1] == end_symbol:
+                    new_beams.append((seq, score))
+                    continue
+
+                tgt_mask = model.create_tgt_mask(seq).to(device)
+                output = model.decoder(seq, encoder_output, tgt_mask, src_mask)
+                
+                # Get the log probabilities of the next token
+                log_probs = F.log_softmax(output[:, -1], dim=-1)
+                top_k_log_probs, top_k_tokens = torch.topk(log_probs, beam_width, dim=-1)
+
+                for i in range(beam_width):
+                    new_seq = torch.cat([seq, top_k_tokens[:, i].unsqueeze(1)], dim=1)
+                    new_score = score + top_k_log_probs[0, i].item()
+                    new_beams.append((new_seq, new_score))
+            
+            # Sort all new beams by score and keep the top `beam_width`
+            beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_width]
+
+            # Stop if the top beam has ended
+            if beams[0][0][0, -1] == end_symbol:
+                break
+                
+    return beams[0][0]
+
+def top_k_sampling_decode(model, src_tensor, src_mask, max_len, start_symbol, end_symbol, device, k=5):
+    """
+    Top-k sampling for translation.
+    """
+    model.eval()
+    with torch.no_grad():
+        encoder_output = model.encoder(src_tensor, src_mask)
+        tgt_tokens = torch.full((src_tensor.size(0), 1), start_symbol, dtype=torch.long, device=device)
+
+        for _ in range(max_len - 1):
+            tgt_mask = model.create_tgt_mask(tgt_tokens).to(device)
+            output = model.decoder(tgt_tokens, encoder_output, tgt_mask, src_mask)
+            
+            # Get the logits for the last token
+            last_logits = output[:, -1, :]
+            
+            # Get top-k logits and their indices
+            top_k_logits, top_k_indices = torch.topk(last_logits, k, dim=-1)
+            
+            # Apply softmax to the top-k logits to get probabilities
+            top_k_probs = F.softmax(top_k_logits, dim=-1)
+            
+            # Sample from the distribution
+            sampled_index = torch.multinomial(top_k_probs, num_samples=1)
+            
+            # Get the actual token index
+            pred_token = torch.gather(top_k_indices, -1, sampled_index)
+            
+            # Append the predicted token
+            tgt_tokens = torch.cat((tgt_tokens, pred_token), dim=1)
+
+            # Stop if the end token is generated
+            if pred_token.item() == end_symbol:
+                break
+                
+    return tgt_tokens

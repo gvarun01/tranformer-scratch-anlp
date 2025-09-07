@@ -1,0 +1,9 @@
+torch
+sentencepiece
+scikit-learn
+matplotlib
+numpy
+sacrebleu
+
+
+

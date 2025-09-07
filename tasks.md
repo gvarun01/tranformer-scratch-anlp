@@ -191,21 +191,21 @@
 
 ## 8. Decoding Strategies
 
-* [ ] **Greedy decoding (`test.py`)**
+* [X] **Greedy decoding (`test.py`)**
 
   * Select `argmax` at each step until `<eos>` or max length.
 
-* [ ] **Beam search decoding (`test.py`)**
+* [X] **Beam search decoding (`test.py`)**
 
   * Keep top-B beams.
   * Expand and prune at each step.
   * Return best sequence.
 
-* [ ] **Top-k sampling decoding (`test.py`)**
+* [X] **Top-k sampling decoding (`test.py`)**
 
   * At each step, sample from top-k tokens (e.g., k=50).
 
-* [ ] **Configurable decoding strategy (`test.py`)**
+* [X] **Configurable decoding strategy (`test.py`)**
 
   * Add CLI flag `--decoding_strategy [greedy|beam|topk]`.
 
@@ -213,7 +213,7 @@
 
 ## 9. Evaluation
 
-* [ ] **BLEU computation (`test.py`)**
+* [X] **BLEU computation (`test.py`)**
 
   * Use sacrebleu to compute BLEU on test translations.
 

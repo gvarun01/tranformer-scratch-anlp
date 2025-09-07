@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional, Tuple
+from utils import apply_rotary_pos_emb, scaled_dot_product_attention
 
 class TokenEmbedding(nn.Module):
     """Token embedding layer with sqrt(d_model) scaling"""
@@ -53,33 +54,37 @@ class TokenEmbedding(nn.Module):
 class MultiHeadAttention(nn.Module):
     """Multi-head attention mechanism for decoder"""
     
-    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1, pos_encoding: str = None, max_seq_len: int = 2048):
         """
         Args:
             d_model: Model dimension
             num_heads: Number of attention heads
             dropout: Dropout rate
+            pos_encoding: Type of positional encoding ('rope' or None)
+            max_seq_len: Maximum sequence length (for RoPE)
         """
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
-        self.d_k = d_model // num_heads  # Dimension per head
+        self.d_k = d_model // num_heads
+        self.pos_encoding = pos_encoding
         
-        # Ensure d_model is divisible by num_heads
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
         
-        # Linear projections for Q, K, V
         self.W_q = nn.Linear(d_model, d_model)
         self.W_k = nn.Linear(d_model, d_model)
         self.W_v = nn.Linear(d_model, d_model)
-        
-        # Output projection
         self.W_o = nn.Linear(d_model, d_model)
         
-        # Dropout
         self.dropout = nn.Dropout(dropout)
         
-        # Initialize weights
+        if self.pos_encoding == 'rope':
+            from utils import RoPE
+            self.rope = RoPE(self.d_k, max_seq_len)
+        elif self.pos_encoding == 'relative_bias':
+            from utils import RelativePositionBias
+            self.relative_bias = RelativePositionBias(max_seq_len, num_heads)
+            
         self._init_weights()
     
     def _init_weights(self):
@@ -120,13 +125,23 @@ class MultiHeadAttention(nn.Module):
         batch_size = Q.size(0)
         
         # Linear projections and split into multiple heads
-        Q = self._split_heads(self.W_q(Q))  # (batch_size, num_heads, seq_len, d_k)
-        K = self._split_heads(self.W_k(K))  # (batch_size, num_heads, seq_len, d_k)
-        V = self._split_heads(self.W_v(V))  # (batch_size, num_heads, seq_len, d_k)
+        Q = self._split_heads(self.W_q(Q))
+        K = self._split_heads(self.W_k(K))
+        V = self._split_heads(self.W_v(V))
         
+        if self.pos_encoding == 'rope':
+            seq_len = Q.size(2)
+            cos, sin = self.rope.get_embeddings(seq_len, Q.device)
+            Q = apply_rotary_pos_emb(Q, cos, sin)
+            K = apply_rotary_pos_emb(K, cos, sin)
+        
+        relative_bias = None
+        if self.pos_encoding == 'relative_bias':
+            seq_len = Q.size(2)
+            relative_bias = self.relative_bias(seq_len)
+
         # Apply scaled dot-product attention
-        from utils import scaled_dot_product_attention
-        attention_output, attention_weights = scaled_dot_product_attention(Q, K, V, mask)
+        attention_output, attention_weights = scaled_dot_product_attention(Q, K, V, mask, relative_bias)
         
         # Combine heads back
         output = self._combine_heads(attention_output)
@@ -195,13 +210,15 @@ class FeedForward(nn.Module):
 class DecoderLayer(nn.Module):
     """Single decoder layer with masked self-attention, cross-attention, and feedforward"""
     
-    def __init__(self, d_model: int, num_heads: int, ff_dim: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, num_heads: int, ff_dim: int, dropout: float = 0.1, pos_encoding: str = None, max_seq_len: int = 2048):
         """
         Args:
             d_model: Model dimension
             num_heads: Number of attention heads
             ff_dim: Feedforward dimension
             dropout: Dropout rate
+            pos_encoding: Type of positional encoding
+            max_seq_len: Maximum sequence length
         """
         super().__init__()
         self.d_model = d_model
@@ -209,10 +226,10 @@ class DecoderLayer(nn.Module):
         self.ff_dim = ff_dim
         
         # Masked multi-head self-attention
-        self.self_attention = MultiHeadAttention(d_model, num_heads, dropout)
+        self.self_attention = MultiHeadAttention(d_model, num_heads, dropout, pos_encoding, max_seq_len)
         
         # Cross-attention with encoder output
-        self.cross_attention = MultiHeadAttention(d_model, num_heads, dropout)
+        self.cross_attention = MultiHeadAttention(d_model, num_heads, dropout, pos_encoding, max_seq_len)
         
         # Feedforward network
         self.feedforward = FeedForward(d_model, ff_dim, dropout)
@@ -285,19 +302,22 @@ class Decoder(nn.Module):
         # Token embeddings
         self.token_embedding = TokenEmbedding(vocab_size, d_model, pad_idx)
         
-        # Positional encoding
+        # Positional encoding layer (for RoPE)
+        self.pos_encoding_layer = None
         if pos_encoding == 'rope':
-            from utils import RoPE
-            self.pos_encoding_layer = RoPE(d_model, max_seq_len)
+            # RoPE is applied in MultiHeadAttention, but we can keep a reference if needed
+            pass
         elif pos_encoding == 'relative_bias':
             from utils import RelativePositionBias
             self.pos_encoding_layer = RelativePositionBias(max_seq_len, num_heads)
         else:
-            raise ValueError(f"Unsupported positional encoding: {pos_encoding}")
-        
+            # Sinusoidal or other positional encodings can be added here
+            from utils import PositionalEncoding
+            self.pos_encoding_layer = PositionalEncoding(d_model, max_seq_len, dropout)
+
         # Stack of decoder layers
         self.layers = nn.ModuleList([
-            DecoderLayer(d_model, num_heads, ff_dim, dropout)
+            DecoderLayer(d_model, num_heads, ff_dim, dropout, pos_encoding, max_seq_len)
             for _ in range(num_layers)
         ])
         
@@ -339,9 +359,8 @@ class Decoder(nn.Module):
         x = self.token_embedding(x)  # (batch_size, seq_len, d_model)
         
         # 2. Add positional encoding
-        if self.pos_encoding == 'rope':
-            x = self.pos_encoding_layer(x, seq_len)
-        # Note: Relative position bias is added during attention computation
+        if self.pos_encoding_layer:
+            x = self.pos_encoding_layer(x)
         
         # 3. Apply dropout
         x = self.dropout(x)
