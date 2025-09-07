@@ -312,7 +312,7 @@ class CheckpointManager:
         self.model_dir = model_dir
     
     def save_checkpoint(self, model: nn.Module, optimizer: optim.Optimizer, 
-                       scheduler: NoamLR, epoch: int, train_losses: list, 
+                       scheduler: 'NoamLR', epoch: int, train_losses: list, 
                        val_losses: list, learning_rates: list, gradient_norms: list,
                        parameter_stats: list, config: dict, is_best: bool = False,
                        best_val_loss: float = float('inf')):
@@ -342,7 +342,7 @@ class CheckpointManager:
             print(f"New best model saved with validation loss: {best_val_loss:.4f}")
     
     def load_checkpoint(self, checkpoint_path: str, model: nn.Module, 
-                       optimizer: optim.Optimizer, scheduler: NoamLR, device: torch.device):
+                       optimizer: optim.Optimizer, scheduler: 'NoamLR', device: torch.device):
         """Load model checkpoint and return epoch number and training state"""
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=device)
