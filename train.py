@@ -10,8 +10,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler
-from torch import autocast
+from torch.amp import GradScaler, autocast
 from encoder import Encoder
 from decoder import Decoder
 from utils import create_padding_mask, create_combined_mask, TranslationDataset, create_dataloader
@@ -412,10 +411,7 @@ class NoamLR:
 
 class LabelSmoothingLoss(nn.Module):
     """
-    Implements label smoothing loss.
-    
-    This loss function encourages the model to be less confident in its predictions,
-    which can lead to better generalization and performance.
+    Simplified and more reliable label smoothing loss implementation.
     """
     
     def __init__(self, smoothing: float, vocab_size: int, pad_idx: int):
@@ -429,38 +425,49 @@ class LabelSmoothingLoss(nn.Module):
         self.smoothing = smoothing
         self.vocab_size = vocab_size
         self.pad_idx = pad_idx
+        self.confidence = 1.0 - smoothing
         
-        # Use Kullback-Leibler divergence loss
-        self.criterion = nn.KLDivLoss(reduction='sum')
+        # Use standard CrossEntropyLoss for comparison
+        self.criterion = nn.CrossEntropyLoss(ignore_index=pad_idx, reduction='mean')
     
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for label smoothing loss
         
         Args:
-            logits: Model output logits of shape (batch_size * seq_len, vocab_size)
-            targets: Ground truth target indices of shape (batch_size * seq_len)
+            logits: Model output logits of shape (N, vocab_size)
+            targets: Ground truth target indices of shape (N,)
         
         Returns:
             Computed loss tensor
         """
-        # Ensure logits are log-probabilities
-        log_probs = torch.log_softmax(logits, dim=-1)
+        if self.smoothing == 0.0:
+            # No smoothing, use standard CrossEntropy
+            return self.criterion(logits, targets)
         
-        # Create smoothed target distribution
-        true_dist = torch.full_like(log_probs, self.smoothing / (self.vocab_size - 1))
-        
-        # Fill the true label positions with (1 - smoothing)
-        true_dist.scatter_(1, targets.unsqueeze(1), 1 - self.smoothing)
-        
-        # Create a mask for padding tokens and apply it
+        # Create mask for non-padding tokens
         non_pad_mask = (targets != self.pad_idx)
-        loss = self.criterion(log_probs[non_pad_mask], true_dist[non_pad_mask])
         
-        # Normalize loss by the number of non-padding tokens
-        num_non_pad_tokens = non_pad_mask.sum()
+        if non_pad_mask.sum() == 0:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
         
-        return loss / num_non_pad_tokens
+        # Filter out padding tokens
+        logits_filtered = logits[non_pad_mask]
+        targets_filtered = targets[non_pad_mask]
+        
+        # Compute log probabilities
+        log_probs = torch.log_softmax(logits_filtered, dim=-1)
+        
+        # Compute negative log likelihood for true labels
+        nll_loss = -log_probs.gather(1, targets_filtered.unsqueeze(1)).squeeze(1)
+        
+        # Compute smooth loss (average of all classes)
+        smooth_loss = -log_probs.mean(dim=-1)
+        
+        # Combine with label smoothing
+        loss = self.confidence * nll_loss + self.smoothing * smooth_loss
+        
+        return loss.mean()
 
 class Trainer:
     """Refactored training class for Transformer model"""
@@ -503,7 +510,7 @@ class Trainer:
         
         # Mixed precision training
         self.use_amp = getattr(config, 'use_amp', False) and device.type == 'cuda'
-        self.scaler = GradScaler() if self.use_amp else None
+        self.scaler = GradScaler('cuda') if self.use_amp else None
         
         # Gradient accumulation
         self.accumulation_steps = getattr(config, 'accumulation_steps', 1)
@@ -552,22 +559,24 @@ class Trainer:
         if self.use_amp:
             # Mixed precision forward pass
             with autocast('cuda'):
-                logits = self.model(src, tgt)
+                # Prepare target for teacher forcing - use input part for model forward pass
+                tgt_input = tgt[:, :-1]  # Remove last token for input
+                tgt_output = tgt[:, 1:]  # Remove first token for targets
                 
-                # Prepare target for loss computation
-                tgt_input = tgt[:, :-1]  # Remove last token
-                tgt_output = tgt[:, 1:]  # Remove first token (<bos>)
+                # Forward pass with correct target input
+                logits = self.model(src, tgt_input)
                 
                 # Reshape logits and targets for loss computation
                 batch_size, seq_len, vocab_size = logits.shape
-                logits_flat = logits[:, :-1, :].contiguous().view(-1, vocab_size)
+                logits_flat = logits.contiguous().view(-1, vocab_size)
                 targets_flat = tgt_output.contiguous().view(-1)
                 
-                # Compute loss and normalize by accumulation steps
-                loss = self.criterion(logits_flat, targets_flat) / self.accumulation_steps
+                # Compute loss (don't divide by accumulation steps here)
+                loss = self.criterion(logits_flat, targets_flat)
             
-            # Backward pass with scaling
-            self.scaler.scale(loss).backward()
+            # Backward pass with scaling (scale by accumulation for gradient accumulation)
+            scaled_loss = loss / self.accumulation_steps
+            self.scaler.scale(scaled_loss).backward()
             
             grad_norm = 0.0
             current_lr = 0.0
@@ -587,22 +596,24 @@ class Trainer:
             
         else:
             # Regular precision forward pass
-            logits = self.model(src, tgt)
+            # Prepare target for teacher forcing - use input part for model forward pass
+            tgt_input = tgt[:, :-1]  # Remove last token for input
+            tgt_output = tgt[:, 1:]  # Remove first token for targets
             
-            # Prepare target for loss computation
-            tgt_input = tgt[:, :-1]  # Remove last token
-            tgt_output = tgt[:, 1:]  # Remove first token (<bos>)
+            # Forward pass with correct target input
+            logits = self.model(src, tgt_input)
             
             # Reshape logits and targets for loss computation
             batch_size, seq_len, vocab_size = logits.shape
-            logits_flat = logits[:, :-1, :].contiguous().view(-1, vocab_size)
+            logits_flat = logits.contiguous().view(-1, vocab_size)
             targets_flat = tgt_output.contiguous().view(-1)
             
-            # Compute loss and normalize by accumulation steps
-            loss = self.criterion(logits_flat, targets_flat) / self.accumulation_steps
+            # Compute loss (don't divide by accumulation steps here)
+            loss = self.criterion(logits_flat, targets_flat)
             
-            # Backward pass
-            loss.backward()
+            # Backward pass (scale by accumulation for gradient accumulation)
+            scaled_loss = loss / self.accumulation_steps
+            scaled_loss.backward()
             
             grad_norm = 0.0
             current_lr = 0.0
@@ -618,7 +629,7 @@ class Trainer:
                 # Update learning rate
                 current_lr = self.scheduler.step()
         
-        return loss.item() * self.accumulation_steps, current_lr, grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+        return loss.item(), current_lr, grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
     
     def validate(self, val_dataloader: DataLoader) -> float:
         """
@@ -646,30 +657,32 @@ class Trainer:
                 if self.use_amp:
                     # Mixed precision forward pass
                     with autocast('cuda'):
-                        logits = self.model(src, tgt)
+                        # Prepare target for teacher forcing
+                        tgt_input = tgt[:, :-1]  # Remove last token for input
+                        tgt_output = tgt[:, 1:]  # Remove first token for targets
                         
-                        # Prepare target for loss computation
-                        tgt_input = tgt[:, :-1]
-                        tgt_output = tgt[:, 1:]
+                        # Forward pass with correct target input
+                        logits = self.model(src, tgt_input)
                         
                         # Reshape for loss computation
                         batch_size, seq_len, vocab_size = logits.shape
-                        logits_flat = logits[:, :-1, :].contiguous().view(-1, vocab_size)
+                        logits_flat = logits.contiguous().view(-1, vocab_size)
                         targets_flat = tgt_output.contiguous().view(-1)
                         
                         # Compute loss
                         loss = self.criterion(logits_flat, targets_flat)
                 else:
                     # Regular precision forward pass
-                    logits = self.model(src, tgt)
+                    # Prepare target for teacher forcing
+                    tgt_input = tgt[:, :-1]  # Remove last token for input
+                    tgt_output = tgt[:, 1:]  # Remove first token for targets
                     
-                    # Prepare target for loss computation
-                    tgt_input = tgt[:, :-1]
-                    tgt_output = tgt[:, 1:]
+                    # Forward pass with correct target input
+                    logits = self.model(src, tgt_input)
                     
                     # Reshape for loss computation
                     batch_size, seq_len, vocab_size = logits.shape
-                    logits_flat = logits[:, :-1, :].contiguous().view(-1, vocab_size)
+                    logits_flat = logits.contiguous().view(-1, vocab_size)
                     targets_flat = tgt_output.contiguous().view(-1)
                     
                     # Compute loss
